@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+
+# data and outputs
+*.mp4
+*.npy
+*.npz
+*.bip
+*.f32
+*.csv
+*.png
+ampcor/
+run/
+data/
