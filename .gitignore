@@ -1,4 +1,6 @@
 __pycache__/
+build/
+dist/
 *.pyc
 
 # data and outputs
@@ -12,3 +14,4 @@ __pycache__/
 ampcor/
 run/
 data/
+.pytest_cache/

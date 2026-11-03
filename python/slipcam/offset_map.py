@@ -2,12 +2,12 @@
 """
 Map of the offsets of the video frames at a given time, over the reference frame
 
-The offsets (from track_offsets.py) are the medians over the frames --frames FIRST LAST, of the
+The offsets (from slipcam-track) are the medians over the frames --frames FIRST LAST, of the
 windows with SNR above --min-snr; across (positive to the right) and down (positive down), in pixels,
 drawn over the reference frame with a diverging color scale (zero is gray).
 
 usage:
-  offset_map.py run/offsets.npz run/frames.npy --frames 770 806 --out run/final_map.png
+  slipcam-map run/offsets.npz run/frames.npy --frames 770 806 --out run/final_map.png
 needs: numpy, matplotlib
 """
 
@@ -36,7 +36,7 @@ def median_offsets(z, first, last, min_snr):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('offsets', help='the .npz of track_offsets.py')
+    parser.add_argument('offsets', help='the .npz of slipcam-track')
     parser.add_argument('frames', help='the .npy of the frames')
     parser.add_argument('--frames', dest='span', type=int, nargs=2, required=True, metavar=('FIRST', 'LAST'),
                         help='the frames to take the median over')

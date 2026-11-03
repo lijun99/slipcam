@@ -8,8 +8,8 @@ the mean absolute difference of consecutive frames (0 for a duplicate), and the 
 burned-in clock of the camera changes (the box of its seconds digits), which mark the real seconds.
 
 usage:
-  decode_frames.py video.mp4 --ffmpeg /path/to/ffmpeg --out run/frames.npy --clock 1150 25 1235 65
-  decode_frames.py news.mp4 --ffmpeg /path/to/ffmpeg --out run/clip.npy --start 25.5 --duration 10   # a clip
+  slipcam-decode video.mp4 --ffmpeg /path/to/ffmpeg --out run/frames.npy --clock 1150 25 1235 65
+  slipcam-decode news.mp4 --ffmpeg /path/to/ffmpeg --out run/clip.npy --start 25.5 --duration 10   # a clip
 needs: numpy
 """
 

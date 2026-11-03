@@ -7,7 +7,7 @@ down) of its windows with SNR above --min-snr, per frame; the time is relative t
 at --fps. The series are saved to a .csv and plotted (across and down, one panel each).
 
 usage:
-  region_series.py run/offsets.npz --region driveway 150 450 1200 650 --region field 980 140 1200 220 \
+  slipcam-regions run/offsets.npz --region driveway 150 450 1200 650 --region field 980 140 1200 220 \
       --out run/series
 needs: numpy, matplotlib
 """
@@ -40,7 +40,7 @@ def region_series(z, box, min_snr):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('offsets', help='the .npz of track_offsets.py')
+    parser.add_argument('offsets', help='the .npz of slipcam-track')
     parser.add_argument('--region', nargs=5, action='append', required=True, metavar=('NAME', 'X0', 'Y0', 'X1', 'Y1'),
                         help='a region, pixels (repeatable)')
     parser.add_argument('--min-snr', type=float, default=4, help='the smallest SNR of the windows used (default: %(default)s)')

@@ -17,7 +17,7 @@ side (.csv, .png): the slip (across, the fault-parallel direction in the image),
 fit of the camera motion.
 
 usage:
-  slip_series.py run/offsets.npz run/frames.npy --near 150 450 1200 650 --far 980 130 1220 230 \
+  slipcam-slip run/offsets.npz run/frames.npy --near 150 450 1200 650 --far 980 130 1220 230 \
       --final 770 806 --final-slip 2.5 --out run/slip
 needs: numpy, matplotlib
 """
@@ -30,8 +30,8 @@ import numpy as np
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt                     # noqa: E402
 
-from offset_map import DIVERGING, INK, INK2        # noqa: E402
-from region_series import SERIES, GRID              # noqa: E402
+from .offset_map import DIVERGING, INK, INK2        # noqa: E402
+from .region_series import SERIES, GRID              # noqa: E402
 
 
 def in_boxes(z, boxes):
@@ -91,7 +91,7 @@ def pulse_metrics(t, series, final, smooth=5, hold=30):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument('offsets', help='the .npz of track_offsets.py')
+    parser.add_argument('offsets', help='the .npz of slipcam-track')
     parser.add_argument('frames', help='the .npy of the frames (for the map)')
     parser.add_argument('--near', type=float, nargs=4, action='append', required=True, metavar=('X0', 'Y0', 'X1', 'Y1'),
                         help='a box of the camera side, pixels (repeatable)')

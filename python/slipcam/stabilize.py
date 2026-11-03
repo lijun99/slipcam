@@ -16,7 +16,7 @@ needs: numpy, scipy
 import numpy as np
 from scipy import ndimage, signal
 
-from slip_series import fit_camera
+from .slip_series import fit_camera
 
 
 def ncc_peak(template, search):

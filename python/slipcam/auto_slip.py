@@ -2,16 +2,16 @@
 """
 Fault slip from a video, without choosing regions by hand
 
-From the frames of decode_frames.py:
+From the frames of slipcam-decode:
 
 1. timing: the frozen frames (identical to the previous one), the onset of the shaking (the jump of the
    differences of consecutive frames), and the reference frame, the last calm frame before it; if there
    are no calm frames (a clip starting during the shaking, a phone filming a screen), the first frame,
-   and the frames are first stabilized on it (stabilize.py, --stabilize);
+   and the frames are first stabilized on it (slipcam.stabilize, --stabilize);
 2. text: the burned-in text, pixels of strong edges that do not change while the scene shakes; the
    windows over it are masked;
-3. tracking: the offsets of the frames relative to the reference frame, with pycuampcor on the GPU
-   (track_offsets.track);
+3. tracking: the offsets of the frames relative to the reference frame, with framecor (or pycuampcor,
+   --engine) on the GPU (track_offsets.track);
 4. quality: the windows of a periodic or flat texture, whose correlation with their own surroundings in
    the reference frame has a second peak (--max-periodicity), are flagged, and the offsets of low SNR
    (--min-snr) dropped;
@@ -26,9 +26,9 @@ From the frames of decode_frames.py:
    its spread, and the rise and peak rate of the slip (slip_series.pulse_metrics), in pixels.
 
 usage:
-  auto_slip.py ../data/run/frames.npy --out ../data/auto/myanmar
-  auto_slip.py ../data/run/frames.npy --out ../data/auto/myanmar --explain 980 130 1220 200   # why a box was used
-needs: numpy, scipy, matplotlib, pycuampcor
+  slipcam-auto ../data/run/frames.npy --out ../data/auto/myanmar
+  slipcam-auto ../data/run/frames.npy --out ../data/auto/myanmar --explain 980 130 1220 200   # why a box was used
+needs: numpy, scipy, matplotlib, framecor (or pycuampcor)
 """
 
 import argparse
@@ -42,11 +42,11 @@ from scipy import ndimage, signal
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt                     # noqa: E402
 
-from offset_map import INK, INK2                    # noqa: E402
-from region_series import SERIES, GRID              # noqa: E402
-from slip_series import fit_camera, pulse_metrics   # noqa: E402
-from stabilize import coarse_track, stabilize       # noqa: E402
-from track_offsets import track, window_grid        # noqa: E402
+from .offset_map import INK, INK2                    # noqa: E402
+from .region_series import SERIES, GRID              # noqa: E402
+from .slip_series import fit_camera, pulse_metrics   # noqa: E402
+from .stabilize import coarse_track, stabilize       # noqa: E402
+from .track_offsets import track, window_grid        # noqa: E402
 
 
 def frame_differences(frames, chunk=50):
@@ -224,6 +224,9 @@ def main():
     parser.add_argument('--stabilize', choices=('auto', 'on', 'off'), default='auto',
                         help='warp the frames onto the reference first: auto, if there are no calm frames before '
                              'the shaking (default: %(default)s)')
+    parser.add_argument('--engine', choices=('framecor', 'pycuampcor'), default='framecor',
+                        help='the correlation engine (default: %(default)s)')
+    parser.add_argument('--cpu', action='store_true', help='correlate on the CPU')
     parser.add_argument('--explain', type=float, nargs=4, action='append', default=[], metavar=('X0', 'Y0', 'X1', 'Y1'),
                         help='print why the windows of a box were used or not (repeatable)')
     parser.add_argument('--out', required=True, help='the output prefix')
@@ -281,12 +284,13 @@ def main():
     # 3. tracking (cached)
     cache = args.out + '_offsets.npz'
     if (os.path.exists(cache) and int(np.load(cache)['ref']) == ref and np.array_equal(np.load(cache)['masked'], masked)
-            and bool(np.load(cache).get('stabilized', False)) == stab):
+            and bool(np.load(cache).get('stabilized', False)) == stab
+            and str(np.load(cache).get('engine', 'pycuampcor')) == args.engine):
         z = dict(np.load(cache))
         print(f'3. tracking: cached in {cache}')
     else:
         z = track(frames, ref, np.arange(ref, n), args.out + '_ampcor', masked=masked,
-                  window=args.window, skip=args.skip, search=args.search)
+                  window=args.window, skip=args.skip, search=args.search, cpu=args.cpu, engine=args.engine)
         z['stabilized'] = stab
         np.savez(cache, **z)
     off, snr = z['offsets'], z['snr']

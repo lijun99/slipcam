@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Dense offsets of the frames of a video relative to a reference frame, with pycuampcor
+Dense offsets of the frames of a video relative to a reference frame, with framecor or pycuampcor
 
 Each frame from --first to --last is correlated with the reference frame (--ref, e.g., the last one
 before the shaking), on a grid of windows; the offsets are in pixels, (down, across), the motion of
 the frame relative to the reference. The windows that overlap the burned-in text of the camera
 (--mask, boxes in pixels) are flagged, as the text does not move with the scene.
 
+The engine is framecor (default; the frames in memory, the reference windows transformed once) or
+pycuampcor (one run per frame, through files); both on the GPU, or on the CPU with --cpu.
+
 usage:
-  track_offsets.py run/frames.npy --ref 285 --first 140 --out run/offsets.npz \
+  slipcam-track run/frames.npy --ref 285 --first 140 --out run/offsets.npz \
       --mask 870 25 1240 68 --mask 40 650 630 700
-needs: numpy, pycuampcor
+needs: numpy, framecor or pycuampcor
 """
 
 import argparse
@@ -18,15 +21,14 @@ import os
 import time
 
 import numpy as np
-import pycuampcor
 
 
 def window_grid(h, w, window, skip, search):
-    """The grid of the windows of pycuampcor: its parameters, and the first pixels (down, across)"""
-    grid = pycuampcor.window_grid(h, w, window=(window, window), search=(search, search), skip=(skip, skip))
-    y0 = grid['referenceStartPixelDownStatic'] + skip * np.arange(grid['numberWindowDown'])
-    x0 = grid['referenceStartPixelAcrossStatic'] + skip * np.arange(grid['numberWindowAcross'])
-    return grid, y0, x0
+    """The grid of the windows, as pycuampcor.window_grid: its parameters, and the first pixels (down, across)"""
+    ny, nx = ((size - 2 * search - window) // skip for size in (h, w))
+    grid = dict(referenceStartPixelDownStatic=search, referenceStartPixelAcrossStatic=search,
+                numberWindowDown=ny, numberWindowAcross=nx)
+    return grid, search + skip * np.arange(ny), search + skip * np.arange(nx)
 
 
 def boxes_mask(y0, x0, window, boxes):
@@ -37,8 +39,14 @@ def boxes_mask(y0, x0, window, boxes):
     return masked
 
 
-def track(frames, ref, index, workdir, masked=None, window=64, skip=16, search=48, cpu=False):
-    """The offsets of the frames index relative to the frame ref, with pycuampcor; a dict as saved by main"""
+def track(frames, ref, index, workdir, masked=None, window=64, skip=16, search=48, cpu=False,
+          engine='framecor', chunk=64):
+    """The offsets of the frames index relative to the frame ref; a dict as saved by main
+
+    engine: framecor (chunk frames per call) or pycuampcor (one run per frame, its files in workdir)"""
+    if engine == 'framecor':
+        return track_framecor(frames, ref, index, masked, window, skip, search, cpu, chunk)
+    import pycuampcor
     n, h, w = frames.shape
     os.makedirs(workdir, exist_ok=True)
     refname, sec = os.path.join(workdir, 'reference.f32'), os.path.join(workdir, 'secondary.f32')
@@ -80,7 +88,36 @@ def track(frames, ref, index, workdir, masked=None, window=64, skip=16, search=4
     print(f'{len(index)} frames of {ny} x {nx} windows in {elapsed:.1f} s ({elapsed / len(index) * 1e3:.0f} ms per frame), '
           f'{masked.sum()} windows masked')
     return dict(index=index, ref=ref, offsets=offsets, snr=snr, cov=cov, masked=masked,
-                yc=y0 + window / 2, xc=x0 + window / 2, window=window, skip=skip, search=search)
+                yc=y0 + window / 2, xc=x0 + window / 2, window=window, skip=skip, search=search,
+                engine='pycuampcor')
+
+
+def track_framecor(frames, ref, index, masked=None, window=64, skip=16, search=48, cpu=False, chunk=64):
+    """The offsets of the frames index relative to the frame ref, with framecor; as track, with the peaks"""
+    from . import framecor
+    n, h, w = frames.shape
+    _, y0, x0 = window_grid(h, w, window, skip, search)
+    ny, nx = len(y0), len(x0)
+    if masked is None:
+        masked = np.zeros((ny, nx), bool)
+    cor = framecor.Correlator(h, w, y0, x0, window=window, search=search, backend='cpu' if cpu else 'auto')
+    index = np.asarray(index)
+    out = {key: np.empty((len(index), ny, nx) + tail, np.float32)
+           for key, tail in (('offsets', (2,)), ('snr', ()), ('cov', (3,)), ('peak', ()))}
+    tic = time.perf_counter()
+    cor.set_reference(np.ascontiguousarray(frames[ref]))
+    for k0 in range(0, len(index), chunk):
+        sel = index[k0:k0 + chunk]
+        # a run of consecutive frames: a slice of the (memory-mapped) frames, without a copy
+        run = np.array_equal(sel, np.arange(sel[0], sel[0] + len(sel)))
+        r = cor.correlate(np.ascontiguousarray(frames[sel[0]:sel[0] + len(sel)] if run else frames[sel]))
+        for key in out:
+            out[key][k0:k0 + len(sel)] = r[key]
+    elapsed = time.perf_counter() - tic
+    print(f'{len(index)} frames of {ny} x {nx} windows in {elapsed:.1f} s ({elapsed / len(index) * 1e3:.1f} ms per frame, '
+          f'framecor {cor.backend}), {masked.sum()} windows masked')
+    return dict(index=index, ref=ref, masked=masked, yc=y0 + window / 2, xc=x0 + window / 2, window=window,
+                skip=skip, search=search, engine='framecor', **out)
 
 
 def main():
@@ -94,8 +131,10 @@ def main():
     parser.add_argument('--search', type=int, default=48, help='the half search range, pixels (default: %(default)s)')
     parser.add_argument('--mask', type=int, nargs=4, action='append', default=[], metavar=('X0', 'Y0', 'X1', 'Y1'),
                         help='a box of burned-in text, pixels (repeatable)')
+    parser.add_argument('--engine', choices=('framecor', 'pycuampcor'), default='framecor',
+                        help='the correlation engine (default: %(default)s)')
     parser.add_argument('--cpu', action='store_true', help='use the CPU implementation')
-    parser.add_argument('--workdir', help='the directory of the temporary images (default: next to --out)')
+    parser.add_argument('--workdir', help='the directory of the temporary images of pycuampcor (default: next to --out)')
     parser.add_argument('--out', required=True, help='the output .npz')
     args = parser.parse_args()
 
@@ -106,7 +145,7 @@ def main():
     _, y0, x0 = window_grid(h, w, args.window, args.skip, args.search)
     masked = boxes_mask(y0, x0, args.window, args.mask)
     result = track(frames, args.ref, np.arange(args.first, last + 1), workdir, masked=masked,
-                   window=args.window, skip=args.skip, search=args.search, cpu=args.cpu)
+                   window=args.window, skip=args.skip, search=args.search, cpu=args.cpu, engine=args.engine)
     np.savez(args.out, **result)
     print(f'-> {args.out}')
 

@@ -1,57 +1,111 @@
 # slipcam
 
-Surface fault slip from video: dense image correlation of the frames on the GPU (pycuampcor), the
-camera motion removed by pairing targets across the fault, and the slip, its duration and its peak
-rate, in pixels.
+Surface fault slip from video: dense image correlation of the frames on the GPU (framecor, or
+pycuampcor), the camera motion removed by pairing targets across the fault, and the slip, its duration
+and its peak rate, in pixels.
 
-## Requirements
+## Install
 
-* Python with numpy, scipy, matplotlib
-* [pycuampcor](https://github.com/earthdef/cuAmpcor) (2.3 or later, built with CUDA; `--cpu` in
-  `track_offsets.py` for the CPU implementation)
-* ffmpeg, to decode the videos (any build; e.g., the one bundled with `imageio-ffmpeg`)
+In an environment with numpy, scipy, matplotlib, pybind11, scikit-build-core, FFTW (single precision)
+and, for the GPU, the CUDA toolkit (e.g., the isce3 conda environment):
 
-The scripts import each other: run them from this directory, or add it to `PYTHONPATH`.
+```bash
+CUDACXX=/usr/local/cuda/bin/nvcc pip install . --no-deps --no-build-isolation \
+    -Ccmake.define.CMAKE_CUDA_ARCHITECTURES=native
+pip install . --no-deps --no-build-isolation -Ccmake.define.FRAMECOR_CUDA=OFF     # CPU only
+python -m pytest tests
+```
+
+Also needed: ffmpeg, to decode the videos (any build; e.g., the one bundled with `imageio-ffmpeg`), and,
+for `--engine pycuampcor`, [pycuampcor](https://github.com/earthdef/cuAmpcor) 2.3 or later.
 
 ## Usage
 
 ```bash
 # frames (uint8 .npy) and the timing of the video, from the burned-in clock if any
-python decode_frames.py video.mp4 --ffmpeg $(which ffmpeg) --out run/frames.npy --clock 1185 28 1235 64
-python decode_frames.py news.mp4 --out run/clip.npy --start 25.71 --duration 10.67      # a clip of a video
+slipcam-decode video.mp4 --ffmpeg $(which ffmpeg) --out run/frames.npy --clock 1185 28 1235 64
+slipcam-decode news.mp4 --out run/clip.npy --start 25.71 --duration 10.67      # a clip of a video
 
 # the automatic pipeline: frames to slip, outputs run/auto_*
-python auto_slip.py run/frames.npy --fps 30 --out run/auto
-python auto_slip.py run/frames.npy --fps 30 --out run/auto --explain 980 130 1220 200   # why a box was (not) used
+slipcam-auto run/frames.npy --fps 30 --out run/auto
+slipcam-auto run/frames.npy --fps 30 --out run/auto --explain 980 130 1220 200   # why a box was (not) used
 ```
 
-Outputs of `auto_slip.py` (prefix `--out`): `_summary.json` (timing, sides, regions, slip, rise, peak
+Outputs of `slipcam-auto` (prefix `--out`): `_summary.json` (timing, sides, regions, slip, rise, peak
 rate), `_region*.csv` (the slip series), `_map.png` (the sides and regions), `_slip.png` (slip and rate),
 and the caches `_offsets.npz`, `_pairs.npz` (and `_stabilized.npy`, `_stabilization.npz`).
 
 The manual steps, for exploring a video or checking the automatic choices:
 
 ```bash
-python track_offsets.py run/frames.npy --ref 285 --first 140 --out run/offsets.npz \
+slipcam-track run/frames.npy --ref 285 --first 140 --out run/offsets.npz \
     --mask 870 25 1240 68 --mask 40 650 630 700                     # boxes of burned-in text
-python offset_map.py run/offsets.npz run/frames.npy --frames 770 806 --vmax 30 --out run/final_map.png
-python region_series.py run/offsets.npz --region fence 1000 210 1220 350 --region field 980 130 1220 200 \
+slipcam-map run/offsets.npz run/frames.npy --frames 770 806 --vmax 30 --out run/final_map.png
+slipcam-regions run/offsets.npz --region fence 1000 210 1220 350 --region field 980 130 1220 200 \
     --tmin 3 --tmax 9 --out run/series
-python slip_series.py run/offsets.npz run/frames.npy --model shift --near 1000 210 1220 350 \
+slipcam-slip run/offsets.npz run/frames.npy --model shift --near 1000 210 1220 350 \
     --far 980 130 1220 200 --final 600 700 --smooth 5 --final-slip 2.5 --out run/slip
 ```
 
-## Scripts
+## Modules
 
-| Script | What it does |
+| Command | Module | What it does |
+|---|---|---|
+| `slipcam-decode` | `slipcam.decode_frames` | video to grayscale frames; frozen and duplicated frames; the ticks of the burned-in clock |
+| `slipcam-track` | `slipcam.track_offsets` | dense offsets of the frames relative to a reference frame, with framecor or pycuampcor |
+| `slipcam-map` | `slipcam.offset_map` | maps of the offsets over the frame |
+| `slipcam-regions` | `slipcam.region_series` | time series of the median offsets of boxes |
+| `slipcam-slip` | `slipcam.slip_series` | the slip of a far-side box relative to a camera-side box; rise, duration, peak rate |
+| | `slipcam.stabilize` | coarse tracking and warping of the frames onto a reference (similarity transform) |
+| `slipcam-auto` | `slipcam.auto_slip` | the automatic pipeline (below) |
+| | `slipcam.framecor` | the correlator (below) |
+
+Each command is also `python -m slipcam.<module>`.
+
+Layout: `python/slipcam` (the package), `cxx` (the C++ and CUDA of framecor), `tests`.
+
+## framecor
+
+pycuampcor is made for SAR images (complex, two passes with oversampled chips, files in and out, one
+run per pair). framecor is a normalized cross-correlation for 8-bit frames, in C++ with a CUDA backend
+(cuFFT) and a CPU backend (FFTW, OpenMP), and a pybind11 module. A grid of square windows of the
+reference frame is searched in each frame within +/- `search` pixels (plus optional integer gross
+offsets, per frame or per window). For each window:
+
+* the correlation with the zero-mean reference window, by real FFTs in batches of windows (of one or
+  more frames, in memory), the spectra of the reference windows computed once;
+* normalized by the variance of the frame under each shift, from summed-area tables (exact integer
+  sums of the 8-bit pixels);
+* the peak refined to sub-pixel by a quadratic fitted to the 3 x 3 surface around it (a single pass);
+* the SNR and the covariance of the offsets as in pycuampcor.
+
+Offsets are (down, across): the motion of the frame relative to the reference frame, as in pycuampcor.
+
+```python
+from slipcam import framecor
+
+down, across = framecor.window_grid(720, 1280, window=64, search=48, skip=16)
+cor = framecor.Correlator(720, 1280, down, across, window=64, search=48, backend='auto')
+cor.set_reference(frames[ref])                       # uint8, height x width
+r = cor.correlate(frames[first:last])                # uint8, frames x height x width
+r['offsets'], r['peak'], r['snr'], r['cov']          # frames x down x across (x 2, x 3)
+r = cor.correlate(frames[first:last], gross=g)       # g: frames x 2, or frames x down x across x 2
+```
+
+On the Myanmar video (2450 windows of 64 x 64 pixels, +/- 48 pixels), on an RTX 4060 laptop GPU and a
+14900HX (16 threads):
+
+| | ms per frame |
 |---|---|
-| `decode_frames.py` | video to grayscale frames; frozen and duplicated frames; the ticks of the burned-in clock |
-| `track_offsets.py` | dense offsets of the frames relative to a reference frame, with pycuampcor |
-| `offset_map.py` | maps of the offsets over the frame |
-| `region_series.py` | time series of the median offsets of boxes |
-| `slip_series.py` | the slip of a far-side box relative to a camera-side box; rise, duration, peak rate |
-| `stabilize.py` | coarse tracking and warping of the frames onto a reference (similarity transform) |
-| `auto_slip.py` | the automatic pipeline (below) |
+| pycuampcor, GPU | 160 |
+| framecor, GPU | 22 |
+| framecor, CPU | 143 |
+
+and the same results: the same SNR distribution; sub-pixel differences of 0.02-0.03 px (MAD); the manual
+slip 35.47 px vs 35.45 px (rise 0.90 s both); the automatic primary region 39.5 px both (peak rate 46.7
+vs 47.4 px/s). The integer peaks differ for 10 % of the windows with SNR >= 4 (2 % before the shaking, 13
+% after it, mostly by 2-4 px at lower correlation, 0.73 vs 0.86): ambiguous surfaces, where pycuampcor's
+second pass moves to another local peak within its zoom window.
 
 ## The automatic pipeline
 
@@ -60,7 +114,7 @@ python slip_series.py run/offsets.npz run/frames.npy --model shift --near 1000 2
 2. **text**: burned-in text, strong edges that do not change while the scene shakes, masked;
 3. **stabilization** (if there are no calm frames, or `--stabilize on`): the frames warped onto the
    reference;
-4. **tracking**: pycuampcor on the GPU;
+4. **tracking**: framecor (or pycuampcor) on the GPU;
 5. **quality**: low SNR dropped; periodic or flat textures (a second peak of their correlation with their
    own surroundings) flagged;
 6. **sides**: the residuals of the offsets just after the slip to a robust fit of the camera motion; the
@@ -84,3 +138,7 @@ The pipeline is automatic for fixed cameras with calm frames before the shaking.
 recordings need a robust stabilization (on the background only, with a homography), or a box of stable
 background from an analyst. The offsets are in pixels: the scale to meters (the distance of the target,
 objects of known size) is not measured.
+
+## License
+
+MIT, copyright California Institute of Technology; see [LICENSE](LICENSE).
