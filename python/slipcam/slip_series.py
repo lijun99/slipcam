@@ -10,7 +10,9 @@ a similarity transform (shift p, q, roll a and scale s about the image center),
 is fitted (robust least squares) to the windows of the camera side of the fault (--near, boxes of
 the frame), and removed from all the windows; the residual offsets are the motion of the ground
 relative to the camera side. The residuals of the far side (--far) are its slip, in pixels; with a
-scale (--scale, m per pixel) or a final slip to calibrate it (--final-slip, m), in meters.
+uniform scale (--scale, m per pixel) or a final slip to calibrate it (--final-slip, m), in meters; with
+scale bars (--scale-bar) or ground control points (--control), each window converted to the ground at
+its own scale (slipcam.scale), the slip along its final direction, in meters.
 
 Outputs: the residual offsets (.npz), a map of the final residuals, and the time series of the far
 side (.csv, .png): the slip (across, the fault-parallel direction in the image), its rate, and the
@@ -23,6 +25,7 @@ needs: numpy, matplotlib
 """
 
 import argparse
+import warnings
 
 import matplotlib
 import numpy as np
@@ -32,6 +35,7 @@ import matplotlib.pyplot as plt                     # noqa: E402
 
 from .offset_map import DIVERGING, INK, INK2        # noqa: E402
 from .region_series import SERIES, GRID              # noqa: E402
+from . import scale as scales                       # noqa: E402
 
 
 def in_boxes(z, boxes):
@@ -108,11 +112,15 @@ def main():
     parser.add_argument('--hold', type=int, default=30, help='the frames the slip stays above 50 %% after its rise (default: %(default)s)')
     parser.add_argument('--scale', type=float, help='meters per pixel of the far side')
     parser.add_argument('--final-slip', type=float, help='the final slip, m, to calibrate the scale')
+    scales.add_arguments(parser)
     parser.add_argument('--tmin', type=float, help='the start of the time axis, s')
     parser.add_argument('--tmax', type=float, help='the end of the time axis, s')
     parser.add_argument('--vmax', type=float, default=15, help='the limit of the color scale of the map, pixels')
     parser.add_argument('--out', required=True, help='the output prefix')
     args = parser.parse_args()
+    model = scales.from_args(args)
+    if model and (args.scale or args.final_slip):
+        parser.error('--scale or --final-slip, or --scale-bar or --control, not both')
 
     z = np.load(args.offsets)
     off, snr = z['offsets'].copy(), z['snr']
@@ -135,7 +143,8 @@ def main():
     np.savez(args.out + '_residuals.npz', index=z['index'], t=t, residuals=res, camera=cam, nfit=nfit,
              near=near, far=far, xc=z['xc'], yc=z['yc'])
 
-    with np.errstate(all='ignore'):
+    with np.errstate(all='ignore'), warnings.catch_warnings():
+        warnings.filterwarnings('ignore', 'All-NaN slice')    # frames without valid windows
         across = np.nanmedian(res[:, far, 1], axis=1)
         down = np.nanmedian(res[:, far, 0], axis=1)
         near_across = np.nanmedian(res[:, near, 1], axis=1)
@@ -159,8 +168,26 @@ def main():
     if scale:
         print(f'scale {scale * 100:.2f} cm/px: final slip {final_px * scale:.2f} m, peak rate {rate[kpeak] * scale:.2f} m/s')
 
+    # the slip on the ground, each window at its own scale
+    if model:
+        XC, YC = np.meshgrid(z['xc'], z['yc'])
+        g = scales.slip(model, XC[far], YC[far], res[:, far][..., ::-1], fin)
+        with np.errstate(all='ignore'), warnings.catch_warnings():
+            warnings.filterwarnings('ignore', 'All-NaN slice')    # frames without valid windows
+            near_m = np.nanmedian(model.ground(XC[near], YC[near], res[:, near][..., ::-1]) @ g['direction'], axis=1)
+        final_m = float(np.nanmedian(g['along'][fin]))
+        mm = pulse_metrics(t, g['along'], final_m, args.smooth, args.hold)
+        local = model.along(np.mean(XC[far]), np.mean(YC[far]), [final_px, np.nanmedian(down[fin])])
+        azimuth = f', azimuth {g["azimuth"]:.0f} deg' if 'azimuth' in g else ''
+        print(f'{model.info}; {local * 100:.2f} cm/px along the slip at the far side')
+        print(f'slip on the ground: final {final_m:.2f} m{azimuth}, normal to it {np.nanmedian(g["normal"][fin]):+.2f} m; '
+              f'rise {mm["t90"] - mm["t10"]:.2f} s; peak rate {mm["peak_rate"]:.2f} m/s at {mm["t_peak"]:.2f} s')
+
     cols = [z['index'], t, across, down, near_across, nfar, cam[:, 0], cam[:, 1], np.degrees(cam[:, 2]), cam[:, 3]]
     head = 'frame,t_s,far_across_px,far_down_px,near_across_px,far_nwin,cam_p_px,cam_q_px,cam_roll_deg,cam_scale'
+    if model:
+        cols += [g['along'], g['normal'], near_m]
+        head += ',far_slip_m,far_normal_m,near_slip_m'
     np.savetxt(args.out + '.csv', np.column_stack(cols), delimiter=',', header=head, comments='', fmt='%.5f')
 
     # the map of the final residuals
@@ -189,25 +216,34 @@ def main():
     fig.savefig(args.out + '_map.png', dpi=110, facecolor='#fcfcfb')
 
     # the time series: slip and its rate (one panel each, one axis each), and the camera roll
-    unit, f = ('m', scale) if scale else ('pixels', 1.0)
+    if model:
+        unit, lines = 'm', (g['along'], g['normal'], near_m)
+        names = ('far side, along its final slip', 'far side, normal to it', 'camera side, along it (should stay at 0)')
+        rate, kpeak, t10, t90 = mm['rate'], mm['kpeak'], mm['t10'], mm['t90']
+    else:
+        f = scale or 1.0
+        unit, lines = 'm' if scale else 'pixels', (across * f, down * f, near_across * f)
+        names = ('far side, across (fault-parallel)', 'far side, down', 'camera side, across (should stay at 0)')
+        rate = rate * f
     roll = args.model == 'similarity'
     fig, axes = plt.subplots(3 if roll else 2, 1, figsize=(11, 8 if roll else 6.5), sharex=True,
                              constrained_layout=True, gridspec_kw=dict(height_ratios=(3, 2, 1.5)[:3 if roll else 2]))
-    axes[0].plot(t, across * f, color=SERIES[1], lw=1.8, label='far side, across (fault-parallel)')
-    axes[0].plot(t, down * f, color=SERIES[2], lw=1.4, label='far side, down')
-    axes[0].plot(t, near_across * f, color=SERIES[0], lw=1.4, label='camera side, across (should stay at 0)')
+    for series, color, lw, name in zip(lines, (SERIES[1], SERIES[2], SERIES[0]), (1.8, 1.4, 1.4), names):
+        axes[0].plot(t, series, color=color, lw=lw, label=name)
     axes[0].axvspan(t10, t90, color=GRID, alpha=0.6, lw=0)
     axes[0].set_ylabel(f'Slip, {unit}', color=INK2, fontsize=9)
     axes[0].legend(frameon=False, fontsize=9, loc='upper left', labelcolor=INK)
     title = 'Fault slip from the CCTV video, relative to the camera side'
     if scale and args.final_slip:
         title += f' (scale calibrated to a final slip of {args.final_slip} m)'
+    elif model:
+        title += f' ({model.info})'
     axes[0].set_title(title, color=INK, fontsize=11, loc='left')
     for tg in t[gap]:
         axes[0].axvline(tg, color=INK2, lw=0.6, ls=':')
-    axes[1].plot(t, rate * f, color=SERIES[1], lw=1.6)
+    axes[1].plot(t, rate, color=SERIES[1], lw=1.6)
     axes[1].set_ylabel(f'Slip rate, {unit}/s ({args.smooth}-frame smoothing)', color=INK2, fontsize=9)
-    axes[1].annotate(f'peak {rate[kpeak] * f:.1f} {unit}/s', (t[kpeak], rate[kpeak] * f), xytext=(8, -4),
+    axes[1].annotate(f'peak {rate[kpeak]:.{2 if unit == "m" else 1}f} {unit}/s', (t[kpeak], rate[kpeak]), xytext=(8, -4),
                      textcoords='offset points', color=INK, fontsize=9)
     if roll:
         axes[2].plot(t, np.degrees(cam[:, 2]), color=SERIES[0], lw=1.4)
@@ -223,7 +259,7 @@ def main():
     tmax = args.tmax if args.tmax is not None else t[-1]
     axes[-1].set_xlim(tmin, tmax)
     shown = (t >= tmin) & (t <= tmax)
-    lo, hi = np.min(rate[shown] * f), np.max(rate[shown] * f)
+    lo, hi = np.min(rate[shown]), np.max(rate[shown])
     axes[1].set_ylim(min(lo, 0) - 0.1 * (hi - lo), hi + 0.15 * (hi - lo))
     fig.savefig(args.out + '.png', dpi=110, facecolor='#fcfcfb')
     print(f'-> {args.out}.csv, {args.out}.png, {args.out}_map.png, {args.out}_residuals.npz')

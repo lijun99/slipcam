@@ -10,8 +10,8 @@ From the frames of slipcam-decode:
    and the frames are first stabilized on it (slipcam.stabilize, --stabilize);
 2. text: the burned-in text, pixels of strong edges that do not change while the scene shakes; the
    windows over it are masked;
-3. tracking: the offsets of the frames relative to the reference frame, with framecor (or pycuampcor,
-   --engine) on the GPU (track_offsets.track);
+3. tracking: the offsets of the frames relative to the reference frame, with framecor on the GPU
+   (track_offsets.track);
 4. quality: the windows of a periodic or flat texture, whose correlation with their own surroundings in
    the reference frame has a second peak (--max-periodicity), are flagged, and the offsets of low SNR
    (--min-snr) dropped;
@@ -23,12 +23,14 @@ From the frames of slipcam-decode:
    offsets, which cancels the motion of the camera without a model of it;
 7. slip: per region of the far side (neighbors of similar final offsets), the median of the paired
    differences of its windows,
-   its spread, and the rise and peak rate of the slip (slip_series.pulse_metrics), in pixels.
+   its spread, and the rise and peak rate of the slip (slip_series.pulse_metrics), in pixels; with a
+   scale (--scale, --scale-bar or --control, slipcam.scale), also on the ground, in meters, each window
+   at its own scale.
 
 usage:
   slipcam-auto ../data/run/frames.npy --out ../data/auto/myanmar
   slipcam-auto ../data/run/frames.npy --out ../data/auto/myanmar --explain 980 130 1220 200   # why a box was used
-needs: numpy, scipy, matplotlib, framecor (or pycuampcor)
+needs: numpy, scipy, matplotlib
 """
 
 import argparse
@@ -46,7 +48,9 @@ from .offset_map import INK, INK2                    # noqa: E402
 from .region_series import SERIES, GRID              # noqa: E402
 from .slip_series import fit_camera, pulse_metrics   # noqa: E402
 from .stabilize import coarse_track, stabilize       # noqa: E402
-from .track_offsets import track, window_grid        # noqa: E402
+from . import framecor                               # noqa: E402
+from . import scale as scales                       # noqa: E402
+from .track_offsets import track                     # noqa: E402
 
 
 def frame_differences(frames, chunk=50):
@@ -224,13 +228,17 @@ def main():
     parser.add_argument('--stabilize', choices=('auto', 'on', 'off'), default='auto',
                         help='warp the frames onto the reference first: auto, if there are no calm frames before '
                              'the shaking (default: %(default)s)')
-    parser.add_argument('--engine', choices=('framecor', 'pycuampcor'), default='framecor',
-                        help='the correlation engine (default: %(default)s)')
     parser.add_argument('--cpu', action='store_true', help='correlate on the CPU')
+    parser.add_argument('--scale', type=float, help='a uniform scale, m per pixel')
+    scales.add_arguments(parser)
     parser.add_argument('--explain', type=float, nargs=4, action='append', default=[], metavar=('X0', 'Y0', 'X1', 'Y1'),
                         help='print why the windows of a box were used or not (repeatable)')
     parser.add_argument('--out', required=True, help='the output prefix')
     args = parser.parse_args()
+    model = scales.from_args(args)
+    if model and args.scale:
+        parser.error('--scale, or --scale-bar or --control, not both')
+    model = model or (scales.uniform(args.scale) if args.scale else None)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     frames = np.load(args.frames, mmap_mode='r')
@@ -254,7 +262,7 @@ def main():
     summary['warnings'] = warnings
 
     # 2. text
-    _, y0, x0 = window_grid(h, w, args.window, args.skip, args.search)
+    y0, x0 = framecor.window_grid(h, w, args.window, args.search, args.skip)
     text = text_mask(frames, onset or ref)
     print(f'2. text: {text.mean() * 100:.2f} % of the pixels')
 
@@ -285,12 +293,12 @@ def main():
     cache = args.out + '_offsets.npz'
     if (os.path.exists(cache) and int(np.load(cache)['ref']) == ref and np.array_equal(np.load(cache)['masked'], masked)
             and bool(np.load(cache).get('stabilized', False)) == stab
-            and str(np.load(cache).get('engine', 'pycuampcor')) == args.engine):
+            and str(np.load(cache).get('engine', '')) == 'framecor'):
         z = dict(np.load(cache))
         print(f'3. tracking: cached in {cache}')
     else:
-        z = track(frames, ref, np.arange(ref, n), args.out + '_ampcor', masked=masked,
-                  window=args.window, skip=args.skip, search=args.search, cpu=args.cpu, engine=args.engine)
+        z = track(frames, ref, np.arange(ref, n), masked=masked, window=args.window, skip=args.skip,
+                  search=args.search, cpu=args.cpu)
         z['stabilized'] = stab
         np.savez(cache, **z)
     off, snr = z['offsets'], z['snr']
@@ -415,8 +423,18 @@ def main():
                    noise_before_px=noise_pre, noise_after_px=noise_post, t10_s=float(m['t10']), t90_s=float(m['t90']),
                    rise_s=float(m['t90'] - m['t10']), peak_rate_px_s=float(m['peak_rate']), t_peak_s=float(m['t_peak']),
                    onset_frame=int(z['index'][m['k10']]))
-        np.savetxt(f'{args.out}_region{r}.csv', np.column_stack([z['index'], t, series, across, down, lo, hi]),
-                   delimiter=',', header='frame,t_s,slip_px,across_px,down_px,p16_px,p84_px', comments='', fmt='%.4f')
+        columns, header = [z['index'], t, series, across, down, lo, hi], 'frame,t_s,slip_px,across_px,down_px,p16_px,p84_px'
+        if model:
+            # on the ground, each window at its own scale
+            g = scales.slip(model, z['xc'][ix[sel]], z['yc'][iy[sel]], dr, fin)
+            total_m = float(np.nanmedian(g['along'][fin]))
+            mm = pulse_metrics(t, g['along'], total_m, args.smooth)
+            res.update(final_total_m=total_m, final_ground_m=g['final'].tolist(), peak_rate_m_s=float(mm['peak_rate']),
+                       scale_cm_px=float(model.along(np.mean(z['xc'][ix[sel]]), np.mean(z['yc'][iy[sel]]), fr) * 100))
+            if 'azimuth' in g:
+                res['azimuth_deg'] = g['azimuth']
+            columns, header = columns + [g['along']], header + ',slip_m'
+        np.savetxt(f'{args.out}_region{r}.csv', np.column_stack(columns), delimiter=',', header=header, comments='', fmt='%.4f')
         res['_series'], res['_lo'], res['_hi'] = series, lo, hi
         results.append(res)
     # the primary region: of the regions that look like slip (score >= --min-score), the largest slip, i.e.,
@@ -435,8 +453,15 @@ def main():
               f'y {b[1]:.0f}-{b[3]:.0f}; final {res["final_total_px"]:.1f} px (across {res["final_across_px"]:+.1f}, '
               f'down {res["final_down_px"]:+.1f}; windows 16-84 % {res["final_spread_px"][0]:.1f}-{res["final_spread_px"][1]:.1f}); '
               f'rise {res["t10_s"]:.2f}-{res["t90_s"]:.2f} s; peak rate {res["peak_rate_px_s"]:.1f} px/s at {res["t_peak_s"]:.2f} s')
+        if model:
+            azimuth = f', azimuth {res["azimuth_deg"]:.0f} deg' if 'azimuth_deg' in res else ''
+            print(f'   on the ground ({res["scale_cm_px"]:.2f} cm/px along the slip): final {res["final_total_m"]:.2f} m'
+                  f'{azimuth}; peak rate {res["peak_rate_m_s"]:.2f} m/s')
     np.savez(args.out + '_pairs.npz', t=t, index=z['index'], far_yx=np.column_stack([iy, ix]),
              near_yx=np.column_stack([ny_, nx_]), partners=partners, diffs=diffs, regions=regions[iy, ix])
+    if model:
+        summary['scale'] = model.info
+        print(f'   scale: {model.info}')
     summary['regions'] = [{k: v for k, v in r.items() if not k.startswith('_')} for r in results]
     summary['primary_region'] = results[0]['region'] if results and results[0]['primary'] else None
     with open(args.out + '_summary.json', 'w') as f:
@@ -476,8 +501,9 @@ def main():
         c = colors[r['region']]
         mr = pulse_metrics(t, r['_series'], r['final_total_px'], args.smooth)
         axes[0].fill_between(t, r['_lo'], r['_hi'], color=c, alpha=0.18, lw=0)
+        meters = f' ({r["final_total_m"]:.2f} m)' if model else ''
         axes[0].plot(t, r['_series'], color=c, lw=1.8, label=f'region {r["region"]}: {r["windows"]} windows, '
-                     f'final {r["final_total_px"]:.1f} px')
+                     f'final {r["final_total_px"]:.1f} px{meters}')
         axes[1].plot(t, mr['rate'], color=c, lw=1.6)
     axes[0].set_ylabel('Slip, pixels (band: 16-84 % of windows)', color=INK2, fontsize=9)
     axes[0].legend(frameon=False, fontsize=9, loc='upper left', labelcolor=INK)
